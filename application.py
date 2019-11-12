@@ -108,7 +108,7 @@ def sound():
 
 
 @app.route('/as')
-def nlp():
+def audio_process():
     papers = get_arxiv_paper_list(ROOT_URL + CAT_AS)
     papers = get_arxiv_abstract(papers)
     return papers
