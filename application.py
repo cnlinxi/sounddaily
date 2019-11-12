@@ -1,8 +1,6 @@
-from __future__ import print_function
 import logging
 import time
 import re
-import feedparser
 import requests
 from bs4 import BeautifulSoup
 
@@ -128,8 +126,3 @@ def nlp():
     papers = get_arxiv_paper_list(ROOT_URL + CAT_MM)
     papers = get_arxiv_abstract(papers)
     return papers
-
-
-if __name__ == '__main__':
-    papers = get_arxiv_paper_list(ROOT_URL + CAT_SOUND)
-    print_function(get_arxiv_abstract(papers))
