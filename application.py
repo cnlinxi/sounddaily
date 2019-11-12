@@ -126,3 +126,7 @@ def nlp():
     papers = get_arxiv_paper_list(ROOT_URL + CAT_MM)
     papers = get_arxiv_abstract(papers)
     return papers
+
+
+if __name__ == '__main__':
+    app.run()
