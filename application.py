@@ -106,7 +106,7 @@ def hello():
 def sound():
     papers = get_arxiv_paper_list(ROOT_URL + CAT_SOUND)
     papers = get_arxiv_abstract(papers)
-    return papers
+    return str(papers)
 
 
 @app.route('/as')
