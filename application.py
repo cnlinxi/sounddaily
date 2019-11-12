@@ -3,309 +3,133 @@ import logging
 import time
 import re
 import feedparser
+import requests
+from bs4 import BeautifulSoup
 
 from flask import Flask
 
-try:
-    # Python 3
-    from urllib.parse import urlencode
-    from urllib.request import urlretrieve
-except ImportError:
-    # Python 2
-    from urllib import urlencode
-    from urllib import urlretrieve
-
 logger = logging.getLogger(__name__)
 
-
-class Search(object):
-    """
-    Class to search and download abstracts from the arXiv
-    Args:
-        query (string):
-        id_list (list): List of arXiv object IDs.
-        max_results (int): The maximum number of abstracts that should be downloaded. Defaults to
-            infinity, i.e., no limit at all.
-        start (int): The offset of the first returned object from the arXiv query results.
-        sort_by (string): The arXiv field by which the result should be sorted.
-        sort_order (string): The sorting order, i.e. "ascending", "descending" or None.
-        max_chunk_results (int): Internally, a arXiv search query is split up into smaller
-            queries that download the data iteratively in chunks. This parameter sets an upper
-            bound on the number of abstracts to be retrieved in a single internal request.
-        time_sleep (int): Time (in seconds) between two subsequent arXiv REST calls. Defaults to
-            :code:`3`, the recommendation of arXiv.
-        prune (bool): Whether some of the values in each response object should be dropped.
-            Defaults to True.
-    """
-
-    root_url = 'http://export.arxiv.org/api/'
-    prune_keys = [
-        'updated_parsed',
-        'published_parsed',
-        'arxiv_primary_category',
-        'summary_detail',
-        'author',
-        'author_detail',
-        'links',
-        'guidislink',
-        'title_detail',
-        'tags',
-        'id']
-
-    def __init__(self, query_str=None, id_list_str=None, max_results=None, start=0, sort_by=None,
-                 sort_order=None, max_chunk_results=None, time_sleep=3, prune=True):
-
-        self.query = query_str
-        self.id_list = id_list_str
-        self.sort_by = sort_by
-        self.sort_order = sort_order
-        self.max_chunk_results = max_chunk_results
-        self.time_sleep = time_sleep
-        self.prune = prune
-        self.max_results = max_results
-        self.start = start
-
-        if not self.max_results:
-            logger.info('max_results defaulting to inf.')
-            self.max_results = float('inf')
-
-    def _get_url(self, start=0, max_results=None):
-
-        url_args = urlencode(
-            {
-                "search_query": self.query,
-                "id_list": self.id_list,
-                "start": start,
-                "max_results": max_results,
-                "sortBy": self.sort_by,
-                "sortOrder": self.sort_order
-            }
-        )
-
-        return self.root_url + 'query?' + url_args
-
-    def _parse(self, url):
-        """
-        Downloads the data provided by the REST endpoint given in the url.
-        """
-        try:
-            counter_failed = 0
-            result = feedparser.parse(url)
-            is_failed = (result.get('status') != 200)
-            while counter_failed < 5 and is_failed:
-                counter_failed += 1
-                result = feedparser.parse(url)
-                is_failed = (result.get('status') != 200)
-        except Exception as e:
-            logger.error(str(e))
-            return []
-
-        if result.get('status') != 200:
-            logger.error(
-                "HTTP Error {} in query".format(result.get('status', 'no status')))
-            return []
-        return result['entries']
-
-    def _prune_result(self, result):
-        """
-        Deletes some of the keys from the downloaded result.
-        """
-
-        for key in self.prune_keys:
-            try:
-                del result['key']
-            except KeyError:
-                pass
-
-        return result
-
-    def _process_result(self, result):
-
-        # Useful to have for download automation
-        result['pdf_url'] = None
-        for link in result['links']:
-            if 'title' in link and link['title'] == 'pdf':
-                result['pdf_url'] = link['href']
-        result['affiliation'] = result.pop('arxiv_affiliation', 'None')
-
-        result['arxiv_url'] = result.pop('link')
-        result['title'] = result['title'].rstrip('\n')
-        result['summary'] = result['summary'].rstrip('\n')
-        result['authors'] = [d['name'] for d in result['authors']]
-        if 'arxiv_comment' in result:
-            result['arxiv_comment'] = result['arxiv_comment'].rstrip('\n')
-        else:
-            result['arxiv_comment'] = None
-        if 'arxiv_journal_ref' in result:
-            result['journal_reference'] = result.pop('arxiv_journal_ref')
-        else:
-            result['journal_reference'] = None
-        if 'arxiv_doi' in result:
-            result['doi'] = result.pop('arxiv_doi')
-        else:
-            result['doi'] = None
-
-        if self.prune:
-            result = self._prune_result(result)
-
-        return result
-
-    def _get_next(self):
-
-        n_left = self.max_results
-        start = self.start
-
-        while n_left > 0:
-
-            if n_left < self.max_results:
-                logger.info('... play nice on the arXiv and sleep a bit ...')
-                time.sleep(self.time_sleep)
-
-            logger.info('Fetch from arxiv ({} results left to download)'.format(n_left))
-            url = self._get_url(
-                start=start,
-                max_results=min(n_left, self.max_chunk_results))
-
-            results = self._parse(url)
-
-            # Update the entries left to download
-            n_fetched = len(results)
-            logger.info('Received {} entries'.format(n_fetched))
-
-            if n_fetched == 0:
-                logger.info('No more entries left to fetch.')
-                logger.info('Fetching finished.')
-                break
-
-            # Update the number of results left to download
-            n_left = n_left - n_fetched
-            start = start + n_fetched
-
-            # Process results
-            results = [self._process_result(r) for r in results if r.get("title", None)]
-
-            yield results
-
-    def download(self, iterative=False):
-        """
-        Triggers the download of the result of the given search query.
-        Args:
-            iterative (bool): If true, then an iterator is returned, which allows to download the
-                data iteratively. Otherwise, all the data is fetched first and then returned.
-        Returns:
-            iterable: Either a list or a general iterator holding the result of the search query.
-        """
-        logger.info('Start downloading')
-        if iterative:
-            logger.info('Build iterator')
-
-            def iterator():
-                logger.info('Start iterating')
-                for result in self._get_next():
-                    for entry in result:
-                        yield entry
-
-            return iterator
-        else:
-            results = list()
-            for result in self._get_next():
-                # Only append result if title is not empty
-                results = results + result
-            return results
+ROOT_URL = 'https://arxiv.org'
+CAT_SOUND = '/list/cs.SD/recent'
+CAT_AS = '/list/eess.AS/recent'
+CAT_CL = '/list/cs.CL/recent'
+CAT_MM = '/list/cs.MM/recent'
 
 
-def filter_papers_with_submit_date(papers):
-    current_time = time.time()
-    one_day_delta_in_timestamp = 96 * 3600
+def get_arxiv_paper_list(paper_list_url):
+    is_failed = True
+    failed_counter = 0
+    try:
+        papers = []
+        while is_failed and failed_counter < 3:
+            response = requests.get(paper_list_url)
+            if response.status_code == 200:
+                is_failed = False
+            else:
+                time.sleep(1)
+                failed_counter += 1
+                continue
+            list_html_doc = response.content
+            list_soup = BeautifulSoup(list_html_doc, 'lxml')
+            # pages = list_soup.select('body div div#dlpage')[0].dl
+            is_start_paper = False
+            paper = None
+            for x in list_soup.select('body div div#dlpage')[0].dl.children:
+                if (x is None) or (not str(x).strip('\r\n ')):
+                    continue
+                if not is_start_paper:
+                    paper = {}
+                    match_obj = re.match(r'.*?<span class="list-identifier"><a href="(.*?)" title="Abstract">.*?',
+                                         str(x), re.M | re.I)
+                    if match_obj is not None:
+                        paper['link'] = ROOT_URL + str(match_obj.group(1)).strip('\r\n ')
+                        is_start_paper = True
+                else:
+                    match_obj = re.match(
+                        r'.*?<span class="descriptor">Title:</span>(.*?)</div>.*?<span class="descriptor">Authors:</span>(.*?)</div>.*?',
+                        str(x).replace('\n', ''), re.M | re.I)
+                    if match_obj is not None:
+                        paper['title'] = match_obj.group(1).strip('\r\n ')
+                        author_links = match_obj.group(2).replace(',', '').split('</a>')
+                        authors = [x.split('">')[-1].strip('\r\n ') for x in author_links]
+                        authors = [x for x in authors if len(x) > 0]
+                        paper['authors'] = ', '.join(authors)
+                        papers.append(paper)
+                        is_start_paper = False
+    except Exception as e:
+        logger.error('error to get paper list, exception: {}'.format(e))
+        return []
+
+    return papers
+
+
+def get_arxiv_abstract(papers):
     papers_ = []
     for paper in papers:
-        if 'published_parsed' in paper \
-                and current_time - time.mktime(paper['published_parsed']) <= one_day_delta_in_timestamp:
-            paper_ = {}
-            if 'title' in paper:
-                paper_['title'] = paper['title']
-            if 'authors' in paper:
-                paper_['authors'] = ','.join(paper['authors'])
-            if 'summary' in paper:
-                paper_['summary'] = paper['summary'][:40]
-            if 'id' in paper:
-                paper_['link'] = paper['id']
-            papers_.append(paper)
+        try:
+            failed_counter = 0
+            is_failed = True
+            while is_failed and failed_counter < 3:
+                response = requests.get(paper['link'])
+                if response.status_code == 200:
+                    is_failed = False
+                else:
+                    time.sleep(1)
+                    failed_counter += 1
+                    continue
+                abstract_html_doc = response.content
+                match_obj = re.match(r'.*?<span class="descriptor">Abstract:</span>(.*?)</blockquote>.*?',
+                                     str(abstract_html_doc).replace('\n', ''), re.M | re.I)
+                if match_obj is not None:
+                    abstract = match_obj.group(1).strip('\r\n ').replace('\\n', '')
+                    abstract = ' '.join(abstract.split(' ')[:20]) + '...'
+                    paper['abstract'] = abstract
+        except Exception as e:
+            logger.error('error to get {} abstract, exception: {}'.format(paper, e))
+
+        papers_.append(paper)
+        time.sleep(0.5)
 
     return papers_
-
-
-def query(query_str="", id_list=(), prune=True, max_results=None, start=0, sort_by="submittedDate",
-          sort_order="descending", max_chunk_results=10, iterative=False):
-    """
-    See :py:class:`arxiv.Search` for a description of the parameters.
-    """
-
-    search = Search(
-        query_str=query_str,
-        id_list_str=','.join(id_list),
-        sort_by=sort_by,
-        sort_order=sort_order,
-        prune=prune,
-        max_results=max_results,
-        start=start,
-        max_chunk_results=max_chunk_results)
-
-    return search.download(iterative=iterative)
-
-
-def slugify(obj):
-    # Remove special characters from object title
-    filename = '_'.join(re.findall(r'\w+', obj.get('title', 'UNTITLED')))
-    # Prepend object id
-    filename = "%s.%s" % (obj.get('pdf_url').split('/')[-1], filename)
-    return filename
-
-
-def download(obj, dirpath='./', slugify=slugify):
-    if not obj.get('pdf_url', ''):
-        print("Object has no PDF URL.")
-        return
-    if dirpath[-1] != '/':
-        dirpath += '/'
-    path = dirpath + slugify(obj) + '.pdf'
-    urlretrieve(obj['pdf_url'], path)
-    return path
 
 
 app = Flask(__name__)
 
 
-@app.route("/")
+@app.route('/')
 def hello():
     return 'sound daily'
 
 
 @app.route('/sound')
 def sound():
-    papers = query(query_str='cat:cs.SD', iterative=False, max_results=20)
-    papers = filter_papers_with_submit_date(papers)
+    papers = get_arxiv_paper_list(ROOT_URL + CAT_SOUND)
+    papers = get_arxiv_abstract(papers)
+    return papers
+
+
+@app.route('/as')
+def nlp():
+    papers = get_arxiv_paper_list(ROOT_URL + CAT_AS)
+    papers = get_arxiv_abstract(papers)
     return papers
 
 
 @app.route('/multimedia')
 def multimedia():
-    papers = query(query_str='cat:cs.MM', iterative=False, max_results=20)
-    papers = filter_papers_with_submit_date(papers)
+    papers = get_arxiv_paper_list(ROOT_URL + CAT_MM)
+    papers = get_arxiv_abstract(papers)
     return papers
 
 
 @app.route('/nlp')
 def nlp():
-    papers = query(query_str='cat:cs.CL', iterative=False, max_results=20)
-    papers = filter_papers_with_submit_date(papers)
+    papers = get_arxiv_paper_list(ROOT_URL + CAT_MM)
+    papers = get_arxiv_abstract(papers)
     return papers
 
 
-# if __name__ == '__main__':
-#     papers = query(query_str='cat:cs.SD', iterative=False, max_results=20)
-#     print(papers)
-#     print(len(papers))
-#     papers = filter_papers_with_submit_date(papers)
-#     print(len(papers))
-#     print(papers)
+if __name__ == '__main__':
+    papers = get_arxiv_paper_list(ROOT_URL + CAT_SOUND)
+    print_function(get_arxiv_abstract(papers))
